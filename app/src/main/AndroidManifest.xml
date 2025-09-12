@@ -1,0 +1,34 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.ebani.sinage">
+<uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <application
+        android:name=".App"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="Sinage"
+        android:usesCleartextTraffic="true"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Sinage">
+
+        <!-- Pairing screen (no launcher) -->
+        <activity
+            android:name=".pairing.PairingActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Sinage"/>
+
+        <!-- Main playback screen (launcher entry point) -->
+        <activity
+            android:name=".playback.PlayerActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Sinage">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+</manifest>
