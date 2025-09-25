@@ -12,12 +12,8 @@ interface ApiService {
     @GET("api/device/{deviceId}/playlist")
     suspend fun devicePlaylistRaw(@Path("deviceId") deviceId: String): Response<DevicePlaylistResponse>
 
-    @GET("/api/device/{deviceId}/config")
+    @GET("api/device/{deviceId}/config")
     suspend fun getPlayerConfig(@Path("deviceId") deviceId: String): PlayerConfigDTO
-
-//    suspend fun getPlayerConfig(
-//        @Query("deviceId") deviceId: String
-//    ): PlayerConfigDTO
 
 }
 

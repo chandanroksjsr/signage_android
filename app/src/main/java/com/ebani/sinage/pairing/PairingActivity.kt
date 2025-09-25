@@ -6,19 +6,21 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.os.Looper
 import android.util.DisplayMetrics
 import android.view.View
+import android.view.WindowManager
 import android.widget.Toast
+import androidx.annotation.OptIn
 import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import androidx.media3.common.util.UnstableApi
 import com.ebani.sinage.R
 import com.ebani.sinage.data.p.DevicePrefs
-
 import com.ebani.sinage.databinding.ActivityPairingBinding
-import com.ebani.sinage.net.Net
 import com.ebani.sinage.net.SocketHub
 import com.ebani.sinage.net.ws.MsgContentUpdate
 import com.ebani.sinage.net.ws.MsgHandshakeError
@@ -28,14 +30,12 @@ import com.ebani.sinage.net.ws.MsgPing
 import com.ebani.sinage.net.ws.MsgRegistered
 import com.ebani.sinage.net.ws.PairingMessage
 import com.ebani.sinage.playback.PlayerActivity
-import com.ebani.sinage.sync.SyncManager
-import com.ebani.sinage.sync.SyncStatus
 import com.ebani.sinage.util.DisplayUtils
+import io.socket.client.SocketIOException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import org.json.JSONObject
 import timber.log.Timber
 import kotlin.math.roundToInt
 import kotlin.random.Random
@@ -51,15 +51,31 @@ class PairingActivity : AppCompatActivity() {
 
     private val CODE_TTL_SEC = 180 // 3 minutes
 
+    /** Small helper: ensure any UI update runs on the main thread */
+    private inline fun onMain(crossinline block: () -> Unit) {
+        if (Looper.myLooper() === Looper.getMainLooper()) block()
+        else runOnUiThread { block() }
+    }
+
     private val socketListener = object : SocketHub.Listener {
         override fun onConnected() {
             Timber.i("Socket connected (pairing)")
-            setWsStatus(true)
+            setWsStatus(true) // safe: setWsStatus now marshals to main
             // Re-announce current pairing status on reconnect
             if (currentCode.isNotEmpty() && ttlSec > 0) {
                 sendPairingActive(true, currentCode.replace(" ", ""), ttlSec)
             }
         }
+
+        override fun onDisconnected() {
+            setWsStatus(false) // will post to main
+        }
+
+        override fun onReconnect() {
+            setWsStatus(true)
+            sendPairingActive(true, currentCode.replace(" ", ""), ttlSec)
+        }
+
         override fun onMessage(msg: PairingMessage) = handleSocketMessage(msg)
     }
 
@@ -92,7 +108,6 @@ class PairingActivity : AppCompatActivity() {
         binding.resolutionText.text =
             "${pxW}×${pxH}px • ${dpi}dpi • ${dpW}×${dpH}dp • $aspect • $refresh"
 
-        // app version
         val pInfo = packageManager.getPackageInfo(packageName, 0)
         val versionStr = "v${pInfo.versionName} (${pInfo.longVersionCode})"
         binding.appVersionText.text = "App $versionStr"
@@ -106,105 +121,87 @@ class PairingActivity : AppCompatActivity() {
     }
 
     private fun setupWsStatusPill() {
-        // Seed state until we get callbacks
-        setWsStatus(connected = false)
+        setWsStatus(SocketHub.isConnected())
     }
 
-    private fun setWsStatus(connected: Boolean) {
+    /** 🧵 Main-safe now */
+    private fun setWsStatus(connected: Boolean) = onMain {
         binding.wsText.text = if (connected) "Online" else "Offline"
         binding.wsDot.setBackgroundResource(
             if (connected) R.drawable.bg_dot_green else R.drawable.bg_dot_red
         )
     }
 
-
     @RequiresApi(Build.VERSION_CODES.R)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        setShowWhenLocked(true)
+        setTurnScreenOn(true)
+        window.addFlags(
+            WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+        )
         binding = ActivityPairingBinding.inflate(layoutInflater)
         setContentView(binding.root)
-
-
         prefs = DevicePrefs(this)
-
-
-
-
-
         binding.deviceIdText.text = prefs.deviceId
         binding.pairingCodeText.text = "Waiting for pairing…"
         binding.expiry.text = ""
-        binding.retryButton.setOnClickListener { trySync() }
+        binding.ttlRing.progressMax = CODE_TTL_SEC.toFloat()
+        binding.ttlRing.progress = 0f
 
-        // Start hub once (idempotent) and register listener
-//        SocketHub.start(this, Net.WS_URL)
         SocketHub.addListener(socketListener)
-        setupWsStatusPill()
+
         setupUiBasics()
         fillDeviceInfo()
-
-        // Start pairing UI loop once
         startPairingLoop()
+        setupWsStatusPill()
     }
 
     private fun trySync() {
-        binding.retryButton.isEnabled = false
-        lifecycleScope.launch {
-//            when (SyncManager.syncNow(this@PairingActivity)) {
-//                SyncStatus.OK -> goToPlayer()
-//                SyncStatus.EMPTY -> {
-//                    Toast.makeText(this@PairingActivity, "Device registered, no content yet. Showing fallback.", Toast.LENGTH_SHORT).show()
-//                    goToPlayer()
-//                }
-//                SyncStatus.NOT_REGISTERED -> {
-//                    binding.pairingCodeText.text = "Device not registered. Finish pairing in admin."
-//                    binding.retryButton.isEnabled = true
-//                }
-//                SyncStatus.ERROR -> {
-//                    Toast.makeText(this@PairingActivity, "Sync failed. Check network and try again.", Toast.LENGTH_SHORT).show()
-//                    binding.retryButton.isEnabled = true
-//                }
-//            }
+        // (Optional) If you want a manual retry to poke the server,
+        // emit current pairing status again or trigger a lightweight sync.
+        if (currentCode.isNotEmpty() && ttlSec > 0) {
+            sendPairingActive(true, currentCode.replace(" ", ""), ttlSec)
+        }
+    }
+
+    private fun onNewCodeStarted() {
+        onMain {
+            binding.ttlRing.progress = CODE_TTL_SEC.toFloat()
+            binding.ttlRing.progressBarColor = getColor(R.color.colorPrimary)
         }
     }
 
     private fun handleSocketMessage(msg: PairingMessage) {
         when (msg) {
             is MsgPairingCode -> {
-                runOnUiThread {
-                    binding.pairingCodeText.text = msg.code
-                }
+                onMain { binding.pairingCodeText.text = msg.code }
             }
-            is MsgRegistered->{
-                goToPlayer();
+            is MsgRegistered -> {
+                onMain { goToPlayer() } // ensure navigation happens on main
             }
             is MsgContentUpdate -> {
-                // Device is registered (or admin changed content) -> stop loop, announce inactive, sync
+                // Device is registered (or admin changed content) -> stop loop, announce inactive
                 pairingJob?.cancel()
                 sendPairingActive(false, currentCode.replace(" ", ""), 0)
-                trySync()
             }
             is MsgHandshakeOk -> {
-                // Optional: you can log/store socketId if you need it
                 Timber.i("WS handshake ok, socketId=${msg.socketId}")
             }
             is MsgHandshakeError -> {
                 Timber.w("WS handshake error: ${msg.reason}")
-                runOnUiThread {
+                onMain {
                     Toast.makeText(this, "Socket handshake error: ${msg.reason}", Toast.LENGTH_SHORT).show()
                 }
             }
-            is MsgPing -> {
-                // no-op
-            }
-            else -> {
-                // future-proof
-                Timber.d("WS msg ignored: $msg")
-            }
+            is MsgPing -> Unit
+            else -> Timber.d("WS msg ignored: $msg")
         }
     }
 
-
+    @OptIn(UnstableApi::class)
     private fun goToPlayer() {
         startActivity(Intent(this, PlayerActivity::class.java))
         finish()
@@ -217,6 +214,7 @@ class PairingActivity : AppCompatActivity() {
                 while (isActive) {
                     currentCode = generateSixDigitCode()
                     ttlSec = CODE_TTL_SEC
+                    onNewCodeStarted()
                     sendPairingActive(true, currentCode.replace(" ", ""), ttlSec)
 
                     var secondsLeft = ttlSec
@@ -237,20 +235,20 @@ class PairingActivity : AppCompatActivity() {
     }
 
     private fun sendPairingActive(active: Boolean, code: String, ttlSec: Int) {
-        val payload = JSONObject()
-            .put("type", "pairing_status")
-            .put("active", active)
-            .put("code", code)
-            .put("ttlSec", ttlSec)
-            .put("deviceId", prefs.deviceId)
-            .put("resolution", DisplayUtils.screenInfoJson(this))
-            .toString()
-
-        if (!SocketHub.sendText(payload)) {
+        try {
+            SocketHub.emitPairingStatus(
+                prefs.deviceId,
+                code,
+                ttlSec,
+                active,
+                DisplayUtils.screenInfoJson(this)
+            )
+        } catch (ex: SocketIOException) {
             Timber.w("Failed to send pairing_status (socket not connected)")
         }
     }
 
+    /** Runs on lifecycleScope (main); safe to update views directly */
     private fun updateUi(code: String, secondsLeft: Int) {
         val mm = secondsLeft / 60
         val ss = secondsLeft % 60
@@ -258,12 +256,17 @@ class PairingActivity : AppCompatActivity() {
         binding.pairingCodeText.text = code
         binding.expiry.textAlignment = View.TEXT_ALIGNMENT_CENTER
         binding.expiry.text = "Expires in: %02d:%02d".format(mm, ss)
+
+        binding.ttlRing.progress = secondsLeft.toFloat()
+
+        if (secondsLeft <= 10) {
+            binding.ttlRing.progressBarColor = 0xFFFF5252.toInt() // red
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         pairingJob?.cancel()
         SocketHub.removeListener(socketListener)
-        setWsStatus(false)
     }
 }

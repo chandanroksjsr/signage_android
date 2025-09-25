@@ -3,14 +3,13 @@ import androidx.room.Entity
 
 @Entity(
     tableName = "playlist_items",
-    primaryKeys = ["id"]
+    primaryKeys = ["playlistId", "assetId", "orderIndex"]
 )
 data class PlaylistItemEntity(
-    val id: String,
     val playlistId: String,
     val assetId: String,
-    val durationSec: Int,
     val orderIndex: Int,
-//    val transition: String?
+    val durationSec: Int,
+    val id: String
 )
 

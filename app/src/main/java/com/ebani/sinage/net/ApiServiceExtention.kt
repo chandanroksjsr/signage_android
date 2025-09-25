@@ -16,10 +16,7 @@ sealed interface PlaylistFetchResult {
 
 suspend fun ApiService.safeGetPlayerConfig(deviceId: String): Result<PlayerConfigDTO> =
     withContext(Dispatchers.IO) {
-        println("A4 deb")
-        runCatching { getPlayerConfig(deviceId)
-
-        }
+        runCatching { getPlayerConfig(deviceId) }
     }
 
 suspend fun ApiService.fetchPlaylistForDevice(deviceId: String): PlaylistFetchResult {

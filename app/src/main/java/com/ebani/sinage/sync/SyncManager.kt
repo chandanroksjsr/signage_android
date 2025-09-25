@@ -14,6 +14,7 @@ sealed class SyncStatus {
     data object OK : SyncStatus()
     data object ERROR : SyncStatus()
     data class UNPAIRED(val deviceId: String) : SyncStatus()
+    data class NOSYNC(val deviceId: String) : SyncStatus()
 }
 
 object SyncManager {
@@ -28,12 +29,16 @@ object SyncManager {
 
     suspend fun syncLayoutOnly(ctx: Context): SyncStatus {
         val res = repo(ctx).syncLayoutOnly() // Result<SyncLayoutResult>
-        res.onSuccess { return SyncStatus.OK }
-
+        res.onSuccess {
+            return SyncStatus.OK
+        }
         val err = res.exceptionOrNull()
         return when (err) {
             is ContentRepository.PairingRequiredException ->
                 SyncStatus.UNPAIRED(err.deviceId)
+            is ContentRepository.NoSyncNeededException ->
+//                SyncStatus.NOSYNC(err.deviceId)
+                return SyncStatus.OK
             else -> {
                 Timber.e(err, "syncLayoutOnly failed")
                 SyncStatus.ERROR
@@ -44,3 +49,4 @@ object SyncManager {
     fun downloadPlaylist(ctx: Context, playlistId: String): Flow<ContentRepository.DownloadProgress> =
         repo(ctx).downloadAssetsForPlaylist(playlistId)
 }
+

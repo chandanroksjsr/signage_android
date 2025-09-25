@@ -2,9 +2,11 @@
 package com.ebani.sinage.data.repo
 
 import android.content.Context
+import android.os.SystemClock
+import androidx.room.withTransaction
 import com.ebani.sinage.data.db.AppDatabase
 import com.ebani.sinage.data.model.AssetEntity
-import com.ebani.sinage.data.model.PlaylistEntity
+import com.ebani.sinage.data.model.DeviceEntity
 import com.ebani.sinage.data.model.PlaylistItemEntity
 import com.ebani.sinage.data.p.DevicePrefs
 import com.ebani.sinage.net.ApiService
@@ -15,7 +17,6 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import timber.log.Timber
 import java.security.MessageDigest
@@ -36,27 +37,38 @@ class ContentRepository(
 
     data class SyncLayoutResult(val playlists: Int, val items: Int)
 
+    // inside ContentRepository.kt (same place as before)
     data class DownloadProgress(
         val playlistId: String,
         val finishedCount: Int,
         val totalCount: Int,
         val bytesDownloaded: Long,
-        val totalBytes: Long
+        val totalBytes: Long,          // dynamic: grows as we learn sizes
+        val rateBytesPerSec: Long,     // smoothed EMA
+        val etaMillis: Long,           // -1 when unknown
+        val currentAssetId: String?,   // null when idle/done
+        val currentRead: Long,         // bytes read in current asset
+        val currentTotal: Long         // -1 when unknown
     ) {
-        val percent: Int = if (totalBytes > 0L) ((bytesDownloaded * 100) / totalBytes).toInt()
-        else if (totalCount > 0) ((finishedCount * 100) / totalCount)
-        else 100
+        val percent: Int =
+            if (totalBytes > 0L) ((bytesDownloaded * 100) / totalBytes).toInt()
+            else if (totalCount > 0) ((finishedCount * 100) / totalCount) else 100
+
+        val currentPercent: Int =
+            if (currentTotal > 0L) ((currentRead * 100) / currentTotal).toInt() else -1
+
         val done: Boolean = (finishedCount >= totalCount) || (totalCount == 0)
     }
+
 
     // a small typed error you can catch in UI
     class PairingRequiredException(val deviceId: String) :
         IllegalStateException("Device $deviceId not paired")
 
+    class NoSyncNeededException(val deviceId: String) :
+        IllegalStateException("Device $deviceId no Sync needed")
     suspend fun syncLayoutOnly(): Result<SyncLayoutResult> = withContext(io) {
-        val deviceId = prefs.deviceId ?: return@withContext Result.failure(
-            IllegalStateException("deviceId missing")
-        )
+        val deviceId = prefs.deviceId
 
         Timber.d("syncLayoutOnly(): fetching config for deviceId=%s", deviceId)
 
@@ -72,32 +84,58 @@ class ContentRepository(
             "safeGetPlayerConfig() OK. paired=%s screen=%s layoutWxH=%sx%s",
             cfg.paired, cfg.screen, cfg.layout.design.width, cfg.layout.design.height
         )
-        runCatching {
-            Timber.d(
-                "config json:\n%s",
-                Json { prettyPrint = true; ignoreUnknownKeys = true }.encodeToString(cfg)
-            )
-        }
 
         if (!cfg.paired || cfg.screen == null) {
+            // If unpaired, clear everything (unchanged behavior)
+            db.device().deleteAll()
+            db.assets().deleteAll()
+            db.playlistItems().deleteAll()
+            db.playlists().deleteAll()
             Timber.w("Device not paired; throwing PairingRequiredException")
             return@withContext Result.failure(PairingRequiredException(deviceId))
         }
 
+
+
+        val currentConfig = sha1(json.encodeToString(cfg.version))
+        Timber.d(
+            "ConfigVersions. lastversion=%s currentversion=%s",
+            prefs.lastConfigHash,currentConfig,
+        )
+
+//        prefs.lastConfigHash = cfg.version
+        if(currentConfig==prefs.lastConfigHash){
+            return@withContext Result.failure(exception =NoSyncNeededException(deviceId) )
+        }
         // Persist screen + layout
         prefs.screenWidth = cfg.layout.design.width
         prefs.screenHeight = cfg.layout.design.height
         prefs.layoutJson = json.encodeToString(cfg.layout)
-        prefs.lastConfigHash = sha1(json.encodeToString(cfg))
+        prefs.lastConfigHash = sha1(json.encodeToString(cfg.version))
 
-        // Upsert DB rows (keep any already-downloaded asset paths)
+        val deviceDetails = DeviceEntity(
+            id = "1",
+            deviceName = cfg.screen.name,
+            registeredOn = cfg.created_at.toString(),
+            deviceId = cfg.deviceId,
+            screenId = cfg.screen.id,
+            adminUser = "TODO()",
+            adminUserId = cfg.userId
+        )
+        db.device().insert(deviceDetails)
+
+        // ────────────────────────────────────────────────────────────────────
+        // POINT 7: Replace per-playlist atomically; prune removed playlists.
+        // No global wipe of playlists/items anymore.
+        // ────────────────────────────────────────────────────────────────────
         var itemCount = 0
-        db.runInTransaction {
-            db.playlists().deleteAll()
-            db.playlistItems().deleteAll()
+        val incomingIds: Set<String> = cfg.playlists.map { it.id }.toSet()
 
+        db.withTransaction {
+            // 1) Upsert assets & prepare playlist items for each incoming playlist
             cfg.playlists.forEach { p ->
-                db.playlists().insert(PlaylistEntity(id = p.id, name = p.name))
+                val newItems = mutableListOf<PlaylistItemEntity>()
+
                 p.items.forEachIndexed { idx, it ->
                     itemCount++
                     val a = it.asset
@@ -107,7 +145,7 @@ class ContentRepository(
                         id = a.id,
                         remoteUrl = a.url,
                         title = a.title,
-                        mediaType = guessExt(a.mediaType, a.url),
+                        mediaType = guessExt(a.mediaType, a.url),  // keep as-is per current schema
                         sizeBytes = a.bytes ?: 0L,
                         hash = a.hash,
                         localPath = existing?.localPath,
@@ -115,16 +153,31 @@ class ContentRepository(
                     )
                     db.assets().upsert(ae)
 
-                    db.playlistItems().insert(
-                        PlaylistItemEntity(
-                            playlistId = p.id,
-                            assetId = a.id,
-                            id = a.id,
-                            orderIndex = idx,
-                            durationSec = it.durationSec ?: 10
-                        )
+                    // Generate a stable primary key for PlaylistItemEntity
+                    val itemId = "${p.id}:${a.id}:$idx"
+                    newItems += PlaylistItemEntity(
+                        id = itemId,
+                        playlistId = p.id,
+                        assetId = a.id,
+                        orderIndex = idx,
+                        durationSec = it.durationSec ?: 10
                     )
                 }
+
+                // 2) Atomically replace this playlist header + items
+                db.playlists().replacePlaylist(
+                    playlistId = p.id,
+                    name = p.name,
+                    newItems = newItems
+                )
+            }
+
+            // 3) Delete playlists (and their items) that are no longer in config
+            val existing = db.playlists().allPlaylists()
+            val toRemove = existing.filter { it.id !in incomingIds }
+            toRemove.forEach { pl ->
+                db.playlists().deleteItemsForPlaylist(pl.id)
+                db.playlists().deletePlaylist(pl.id)
             }
         }
 
@@ -230,39 +283,129 @@ class ContentRepository(
             }
 
             val toDownload = assets.filter { needsDownload(it) }
-
             val totalCount = toDownload.size
-            val totalBytes = toDownload.sumOf { it.sizeBytes ?: 0L }
-            var finishedCount = 0
-            var doneBytes = 0L
 
-            trySend(DownloadProgress(playlistId, finishedCount, totalCount, doneBytes, totalBytes))
+            // Only sum KNOWN sizes; unknowns will be added exactly once when learned
+            var totalBytesKnown: Long = toDownload.sumOf { it.sizeBytes?.takeIf { s -> s > 0 } ?: 0L }
+            var bytesDownloaded: Long = 0L
+            var finishedCount = 0
+
+            // Smoothing + throttling
+            var emaRateBps = 0.0
+            val EMA_ALPHA = 0.2
+            val MIN_EMIT_MS = 200L
+            var lastEmitMs = 0L
+            var lastTickMs = android.os.SystemClock.elapsedRealtime()
+            fun nowMs() = android.os.SystemClock.elapsedRealtime()
+
+            fun emitProgress(
+                currentId: String?,
+                currentRead: Long,
+                currentTotal: Long,
+                force: Boolean = false
+            ) {
+                val t = nowMs()
+                if (!force && (t - lastEmitMs) < MIN_EMIT_MS) return
+
+                // keep totals sane
+                if (totalBytesKnown < bytesDownloaded) totalBytesKnown = bytesDownloaded
+
+                val remaining = (totalBytesKnown - bytesDownloaded).coerceAtLeast(0L)
+                val etaMs = if (emaRateBps > 1.0) ((remaining / emaRateBps) * 1000).toLong() else -1L
+
+                trySend(
+                    DownloadProgress(
+                        playlistId = playlistId,
+                        finishedCount = finishedCount,
+                        totalCount = totalCount,
+                        bytesDownloaded = bytesDownloaded,
+                        totalBytes = totalBytesKnown,
+                        rateBytesPerSec = emaRateBps.toLong(),
+                        etaMillis = etaMs,
+                        currentAssetId = currentId,
+                        currentRead = currentRead,
+                        currentTotal = currentTotal
+                    )
+                )
+                lastEmitMs = t
+            }
+
+            // Initial ping
+            emitProgress(currentId = null, currentRead = 0L, currentTotal = -1L, force = true)
 
             for (asset in toDownload) {
                 val ext = guessExt(asset.mediaType, asset.remoteUrl)
                 val dest = fileStore.assetFile(asset.id, ext)
 
-                var lastEmitted = 0L
+                // ⬇️ Re-check right before downloading: maybe another region finished it already
+                if (!needsDownload(asset)) {
+                    // add its bytes to progress if we know them (or use actual file length)
+                    val preLen = runCatching { File(asset.localPath ?: "").length() }.getOrElse { 0L }
+                    val contributed = when {
+                        (asset.sizeBytes ?: 0L) > 0L -> asset.sizeBytes!!
+                        preLen > 0L -> preLen
+                        else -> 0L
+                    }
+                    bytesDownloaded += contributed
+                    if (totalBytesKnown < bytesDownloaded) totalBytesKnown = bytesDownloaded
+                    finishedCount++
+                    emitProgress(currentId = null, currentRead = 0L, currentTotal = -1L)
+                    continue
+                }
+
+                var currentRead = 0L
+                var currentTotal = asset.sizeBytes ?: -1L
+                var isFirstProgress = true
+                var announcedTotalForThisAsset = (currentTotal > 0L)
+
                 val ok = fileStore.downloadTo(
                     url = asset.remoteUrl,
                     dest = dest,
-                    onProgress = { read, _ ->
-                        val delta = (read - lastEmitted).coerceAtLeast(0L)
-                        lastEmitted = read
-                        doneBytes += delta
-                        trySend(
-                            DownloadProgress(
-                                playlistId,
-                                finishedCount,
-                                totalCount,
-                                doneBytes,
-                                totalBytes
-                            )
-                        )
+                    onProgress = { read, reportedTotal ->
+                        val t = nowMs()
+                        val dtMs = (t - lastTickMs).coerceAtLeast(1L)
+                        val deltaBytes = (read - currentRead).coerceAtLeast(0L)
+
+                        // Accept a plausible content-length ONCE (prevents GB spikes)
+                        if (isFirstProgress) {
+                            if (!announcedTotalForThisAsset && reportedTotal > 0L && reportedTotal >= read) {
+                                currentTotal = reportedTotal
+                                totalBytesKnown += currentTotal     // add only once per file
+                                announcedTotalForThisAsset = true
+                            }
+                            isFirstProgress = false
+                        }
+
+                        // Advance counters
+                        bytesDownloaded += deltaBytes
+                        currentRead = read
+                        if (totalBytesKnown < bytesDownloaded) totalBytesKnown = bytesDownloaded
+
+                        // Smooth rate
+                        val instRateBps = (deltaBytes * 1000.0) / dtMs.toDouble()
+                        emaRateBps = if (emaRateBps <= 0.0) instRateBps
+                        else EMA_ALPHA * instRateBps + (1.0 - EMA_ALPHA) * emaRateBps
+
+                        lastTickMs = t
+                        emitProgress(currentId = asset.id, currentRead = currentRead, currentTotal = currentTotal)
                     }
                 )
 
-                if (ok) {
+                // Final tick for this asset
+                emitProgress(currentId = asset.id, currentRead = currentRead, currentTotal = currentTotal, force = true)
+
+                // ⬇️ Treat rename/contention as success if dest exists and looks valid
+                var success = ok
+                if (!success) {
+                    val looksValid = dest.isFile && when {
+                        currentTotal > 0L -> dest.length() == currentTotal
+                        (asset.sizeBytes ?: 0L) > 0L -> dest.length() == asset.sizeBytes
+                        else -> dest.length() > 0L
+                    }
+                    if (looksValid) success = true
+                }
+
+                if (success) {
                     finishedCount++
                     db.assets().setDownloaded(
                         id = asset.id,
@@ -270,10 +413,10 @@ class ContentRepository(
                         downloadedAt = System.currentTimeMillis()
                     )
                 }
-
-                trySend(DownloadProgress(playlistId, finishedCount, totalCount, doneBytes, totalBytes))
             }
 
+            // Final done state
+            emitProgress(currentId = null, currentRead = 0L, currentTotal = -1L, force = true)
             close()
         }
     }

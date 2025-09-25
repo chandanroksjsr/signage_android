@@ -7,6 +7,7 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
 import com.ebani.sinage.data.model.AssetEntity
+import com.ebani.sinage.data.model.DeviceEntity
 import com.ebani.sinage.data.model.PlaylistEntity
 import com.ebani.sinage.data.model.PlaylistItemEntity
 
@@ -56,11 +57,11 @@ interface AssetDao {
 
     // AssetDao.kt
     @Query("""
-UPDATE assets
-SET localPath = :localPath,
-    downloadedAt = :downloadedAt
-WHERE id = :id
-""")
+        UPDATE assets
+        SET localPath = :localPath,
+            downloadedAt = :downloadedAt
+        WHERE id = :id
+        """)
     suspend fun setDownloaded(
         id: String,
         localPath: String,
@@ -148,3 +149,17 @@ interface PlaylistItemDao {
      fun itemsForPlaylist(playlistId: String): List<PlaylistItemEntity>
 }
 
+@Dao
+interface DeviceDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    fun insert(entity: DeviceEntity)
+
+    @Query("SELECT * FROM device LIMIT 1")
+    fun getDeviceConfig(): DeviceEntity?   // <- not List<...>
+
+    @Query("SELECT * FROM device")
+    fun getDeviceConfigs(): List<DeviceEntity?>   // <- not List<...>
+
+    @Query("DELETE FROM device")
+    fun deleteAll()
+}

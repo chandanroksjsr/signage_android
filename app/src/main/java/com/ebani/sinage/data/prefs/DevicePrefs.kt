@@ -49,5 +49,12 @@ class DevicePrefs(ctx: Context) {
     var lastConfigHash: String?
         get() = p.getString("last_config_hash", null)
         set(v) = p.edit().putString("last_config_hash", v).apply()
+    var lastConfigVersion: String?
+        get() = p.getString("last_config_version", null)
+        set(v) { p.edit().putString("last_config_version", v).apply() }
+
+    var lastConfigFingerprint: String?
+        get() = p.getString("last_config_fp", null)
+        set(v) { p.edit().putString("last_config_fp", v).apply() }
 
 }

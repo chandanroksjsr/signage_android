@@ -64,52 +64,59 @@
             </LinearLayout>
 
             <!-- Pairing Code Card -->
+            <!-- Pairing Code Card -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:orientation="vertical"
                 android:padding="16dp"
                 android:background="@drawable/bg_card">
-                <TextView
-                    android:id="@+id/pairingCodeText"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:gravity="center"
-                    android:text="Waiting for pairing…"
-                    android:textColor="#FFFFFF"
-                    android:textSize="34sp"
-                    android:fontFamily="monospace"
-                    android:textStyle="bold"
-                    android:paddingTop="6dp"
-                    android:paddingBottom="8dp"/>
 
-                <!-- TTL ring + Expires text -->
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:gravity="center"
-                    android:orientation="vertical"
-                    android:paddingTop="4dp">
+                <!-- Ring + Code centered -->
+                <FrameLayout
+                    android:layout_width="220dp"
+                    android:layout_height="220dp"
+                    android:layout_gravity="center"
+                    android:padding="8dp">
 
-                    <ProgressBar
+                    <!-- Circular countdown ring -->
+                    <com.mikhaellopez.circularprogressbar.CircularProgressBar
                         android:id="@+id/ttlRing"
-                        style="?android:attr/progressBarStyleHorizontal"
-                        android:layout_width="140dp"
-                        android:layout_height="6dp"
-                        android:max="180"
-                        android:progress="0"
-                        android:indeterminate="false"
-                        android:progressTint="#22C55E"
-                        android:backgroundTint="#333333"/>
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:stateListAnimator="@android:anim/linear_interpolator"
+                        app:cpb_background_progressbar_color="#b6bbd8"
+                        app:cpb_background_progressbar_width="5dp"
+                        app:cpb_progress_direction="to_left"
+                        app:cpb_progressbar_color="#3f51b5"
+                        app:cpb_progressbar_width="10dp"
+                        app:cpb_round_border="false" />
+
+                    <!-- Pairing code INSIDE the ring -->
                     <TextView
-                        android:id="@+id/expiry"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="6dp"
-                        android:text="Expires in: 03:00"
-                        android:textColor="#B3B8C2"
-                        android:textSize="12sp"/>
-                </LinearLayout>
+                        android:id="@+id/pairingCodeText"
+                        android:layout_width="180dp"
+                        android:layout_height="180dp"
+                        android:layout_gravity="center"
+                        android:fontFamily="monospace"
+                        android:gravity="center"
+                        android:letterSpacing="0.08"
+                        android:text="000 000"
+                        android:textColor="#FFFFFF"
+                        android:textSize="34sp"
+                        android:textStyle="bold" />
+                </FrameLayout>
+
+                <!-- Expires text below the ring -->
+                <TextView
+                    android:id="@+id/expiry"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="center"
+                    android:layout_marginTop="8dp"
+                    android:text="Expires in: 03:00"
+                    android:textColor="#B3B8C2"
+                    android:textSize="12sp" />
 
                 <LinearLayout
                     android:layout_width="match_parent"
@@ -117,11 +124,13 @@
                     android:gravity="center"
                     android:orientation="horizontal"
                     android:paddingTop="10dp">
+
                     <Button
                         android:id="@+id/retryButton"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="Sync now"/>
+                        android:text="Sync now"
+                        android:visibility="invisible" />
                 </LinearLayout>
             </LinearLayout>
 
@@ -188,11 +197,13 @@
                         android:maxLines="1"
                         android:ellipsize="end"
                         android:text="DEVICE_ID"/>
+
                     <Button
                         android:id="@+id/copyIdBtn"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="Copy"/>
+                        android:text="Copy"
+                        android:visibility="invisible" />
                 </LinearLayout>
             </LinearLayout>
 

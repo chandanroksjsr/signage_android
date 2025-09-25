@@ -12,8 +12,6 @@ data class AssetEntity(
     val localPath: String?,        // filled after download
     val sizeBytes: Long? = null,
     val etag: String? = null,
-//    val createdAt:Long?,
-    val downloadedAt:String?=null, // for conditional downloads
-//    val updatedAt:Long?,
+    val downloadedAt:Long?=null,
     val hash: String?
 )

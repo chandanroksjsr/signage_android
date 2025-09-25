@@ -1,56 +1,73 @@
+// SocketHub.kt
 package com.ebani.sinage.net
 
 import android.content.Context
+import com.ebani.sinage.data.model.DeviceEntity
 import com.ebani.sinage.net.ws.PairingMessage
+import kotlinx.serialization.json.Json
+import org.json.JSONObject
 import java.util.concurrent.CopyOnWriteArraySet
 
-/**
- * Process-wide WebSocket hub.
- * Owns a single SocketClient and fan-outs events to listeners in Activities.
- */
 object SocketHub {
-
     interface Listener {
-        fun onConnected() {
-            println("connected")
-        }
+        fun onConnected()
+        fun onDisconnected()
+        fun onReconnect()
         fun onMessage(msg: PairingMessage) {}
     }
 
-    private var client: SocketClient? = null
     private val listeners = CopyOnWriteArraySet<Listener>()
+    private var client: SocketIoClient? = null
     @Volatile private var started = false
+    private val json = Json { ignoreUnknownKeys = true }
 
-    /** Call once (idempotent). Safe to call from any Activity. */
     @Synchronized
-    fun start(ctx: Context, url: String) {
+    fun start(ctx: Context, baseUrl: String) {
         if (started && client != null) return
-        val appCtx = ctx.applicationContext
-        client = SocketClient(
-            appCtx,
-            url = url,
-            onMessage = { msg -> listeners.forEach { it.onMessage(msg) } },
-            onConnected = { listeners.forEach { it.onConnected() } }
-        ).also {
-            it.connect()           // single owner of connect()
-            started = true
-        }
+        client = SocketIoClient(
+            baseUrl = baseUrl,
+            path = "/api/socket",
+            onConnected = { listeners.forEach { it.onConnected() } },
+            onDisconnected = { listeners.forEach { it.onDisconnected() } },
+            onReconnect = { listeners.forEach { it.onReconnect() } },
+            onJson = { obj ->
+                // Convert server JSON -> your sealed PairingMessage
+                val withType = obj.toString()
+                runCatching { json.decodeFromString<PairingMessage>(withType) }
+                    .onSuccess { pm -> listeners.forEach { it.onMessage(pm) } }
+            }
+        ).also { it.connect(); started = true }
 
     }
 
-    fun addListener(l: Listener) {
-        listeners.add(l)
+    fun addListener(l: Listener) { listeners.add(l) }
+    fun removeListener(l: Listener) { listeners.remove(l) }
+
+    fun emitHandshake(deviceId: String) {
+        client?.emitHandshake(deviceId)
     }
 
-    fun removeListener(l: Listener) {
-        listeners.remove(l)
+    fun emitHandshakeRegistered(device: DeviceEntity?, info: JSONObject) {
+        client?.registeredShake(deviceId =device?.deviceId,userId= device?.adminUserId,info )
     }
 
-    fun sendText(text: String): Boolean = client?.sendText(text) == true
+
+    fun emitPairingStatus(deviceId: String, code: String, ttlSec: Int, active: Boolean, resolution: JSONObject) {
+        client?.emitPairingStatus(deviceId, code, ttlSec, active, resolution)
+    }
+
+    fun broadcast(deviceId: String?, payload: JSONObject) {
+        client?.broadcast(deviceId, payload)
+    }
+    fun startHeartbeat(deviceId: String?, userId:String?){
+        client?.startHeartbeat(deviceId =deviceId, userId = userId)
+    }
+    fun stopheartBeat(){
+        client?.stopHeartbeat()
+    }
 
     fun isConnected(): Boolean = client?.isConnected() == true
 
-    /** Optional: fully stop socket (e.g., app background policy). */
     @Synchronized
     fun stop() {
         started = false

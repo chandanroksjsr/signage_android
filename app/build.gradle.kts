@@ -2,13 +2,13 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.kapt")
-    id("org.jetbrains.kotlin.plugin.serialization") version "1.9.24"
-    id("com.google.devtools.ksp") version "1.9.24-1.0.20"   // <— add
+    id("org.jetbrains.kotlin.plugin.serialization") version "2.2.20"
+    id("com.google.devtools.ksp") version "2.2.20-2.0.3"   // <— add
 }
 
 android {
     namespace = "com.ebani.sinage"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.ebani.sinage"
@@ -49,57 +49,62 @@ kotlin {
 }
 dependencies {
     // Coroutines
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
+    implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.kotlinx.coroutines.core)
 
     // Room (kapt)
-    implementation("androidx.room:room-runtime:2.6.1")
-    implementation("androidx.room:room-ktx:2.6.1")
-    kapt("androidx.room:room-compiler:2.6.1")
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
+    ksp(libs.androidx.room.compiler)
 
     // UI
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.constraintlayout)
-    implementation("com.google.android.material:material:1.12.0")
+    implementation(libs.google.material)
 
     // Networking: Retrofit + OkHttp + Kotlinx Serialization
-    implementation("com.squareup.retrofit2:retrofit:2.11.0")
-    implementation("com.squareup.retrofit2:converter-kotlinx-serialization:2.11.0") // keep
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")              // <— add
+    implementation(libs.retrofit)
+    implementation(libs.converter.kotlinx.serialization) // keep
+    implementation(libs.okhttp)
+    implementation(libs.logging.interceptor)              // <— add
 
-
+    implementation(libs.socket.io.client) // or 2.1.1
+    implementation(libs.java.websocket) // transitively used
 
     // Moshi (JSON) — replace kotlinx-serialization pieces with these:
-    implementation("com.squareup.moshi:moshi:1.15.1")
-    implementation("com.squareup.moshi:moshi-kotlin:1.15.1")
-    ksp("com.squareup.moshi:moshi-kotlin-codegen:1.15.1")
-    implementation("com.squareup.retrofit2:converter-moshi:2.11.0")
+    implementation(libs.moshi)
+    implementation(libs.moshi.kotlin)
+    ksp(libs.moshi.kotlin.codegen)
+    implementation(libs.converter.moshi)
 
 
     // Kotlinx Serialization runtime (matches your plugin)
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+    implementation(libs.kotlinx.serialization.json)
 
     // WorkManager (background sync)
-    implementation("androidx.work:work-runtime-ktx:2.9.1")
+    implementation(libs.androidx.work.runtime.ktx)
 
     // Media / images
-    implementation("androidx.media3:media3-exoplayer:1.3.1")
-    implementation("androidx.media3:media3-ui:1.3.1")
-    implementation("io.coil-kt:coil:2.6.0")
-    implementation("io.coil-kt:coil-gif:2.6.0")
+    implementation(libs.androidx.media3.ui)
+    implementation(libs.androidx.media3.exoplayer)
+    implementation(libs.androidx.media3.transformer)
+    implementation(libs.androidx.media3.common)
+    implementation(libs.androidx.media3.effect)
+    implementation(libs.coil)
+    implementation(libs.coil.gif)
 
     // Lifecycle / Activity
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.3")
-    implementation("androidx.activity:activity-ktx:1.9.1")
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.activity.ktx)
 
     // Optional but helpful for socket/sync lifecycle (foreground/background)
-    implementation("androidx.lifecycle:lifecycle-process:2.8.3")
+    implementation(libs.androidx.lifecycle.process)
 
     // Optional if you want to migrate DevicePrefs to DataStore
     // implementation("androidx.datastore:datastore-preferences:1.1.1")
-
+    implementation(libs.gson)
+    implementation(libs.circularprogressbar)
     // Logging
-    implementation("com.jakewharton.timber:timber:5.0.1")
+    implementation(libs.timber)
 }
 

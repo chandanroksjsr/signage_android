@@ -9,8 +9,11 @@ import retrofit2.converter.kotlinx.serialization.asConverterFactory
 object Net {
 
     // TODO: replace with your real endpoints
-     const val BASE_URL = "http://192.168.29.173:3000/"
-     const val WS_URL   = "ws://192.168.29.173:3000/ws"
+    const val WS_URL   = "http://192.168.29.175"
+//    const val WS_URL   = "https://signage.digitopia.live"
+    const val BASE_URL = "$WS_URL/"
+
+
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -28,22 +31,5 @@ object Net {
     /** Exposed API service */
     val api: ApiService by lazy { retrofit.create(ApiService::class.java) }
 
-    /**
-     * Socket factory — we pass the Application context so callers don’t have to.
-     * Usage:
-     * val ws = Net.socket(onMessage = { /* handle */ }, onConnected = { /* ... */ })
-     * ws.connect()
-     */
-//    fun socket(
-//        onMessage: (PairingMessage) -> Unit,
-//        onConnected: () -> Unit = {}
-//    ): SocketClient {
-//        return SocketClient(
-//            ctx = App.appContext,
-//            url = WS_URL,
-//            onMessage = onMessage,
-//            onConnected = onConnected
-//        )
-//    }
 }
 

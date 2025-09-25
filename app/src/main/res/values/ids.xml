@@ -1,0 +1,5 @@
+<resources>
+    <item name="tag_content_frame" type="id"/>
+    <item name="tag_texture_view"  type="id"/>
+    <item name="tag_image_view"    type="id"/>
+</resources>

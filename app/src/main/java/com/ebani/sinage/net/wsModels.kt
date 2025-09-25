@@ -54,6 +54,9 @@ data class MsgPairingStatusError(val reason: String) : PairingMessage
 @Serializable @SerialName("pairing_code")
 data class MsgPairingCode(val code: String) : PairingMessage
 
+@Serializable @SerialName("unpair_reset")
+class MsgUnpairReset : PairingMessage
+
 /** Tell device it’s registered (or that content changed) */
 @Serializable @SerialName("registered")
 class MsgRegistered : PairingMessage

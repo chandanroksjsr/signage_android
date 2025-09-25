@@ -10,10 +10,14 @@ import kotlinx.serialization.Serializable
 
 @Serializable
 data class PlayerConfigDTO(
+    @SerialName("deviceId") val deviceId: String,
+    @SerialName("userId") val userId: String?=null,
+    @SerialName("created_at") val created_at:String?=null,
     @SerialName("screen") val screen: ScreenDTO?=null,
     @SerialName("playlists") val playlists: List<PlaylistDTO> = emptyList(),
     @SerialName("layout") val layout: LayoutConfigDTO,
-    @SerialName("paired") val paired: Boolean
+    @SerialName("paired") val paired: Boolean,
+    @SerialName("version") val version: String?=null
 )
 
 @Serializable
