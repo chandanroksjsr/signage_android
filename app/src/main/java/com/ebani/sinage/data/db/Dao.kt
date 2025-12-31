@@ -6,6 +6,7 @@ import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
+import com.ebani.sinage.data.model.AnalyticsEntity
 import com.ebani.sinage.data.model.AssetEntity
 import com.ebani.sinage.data.model.DeviceEntity
 import com.ebani.sinage.data.model.PlaylistEntity
@@ -162,4 +163,15 @@ interface DeviceDao {
 
     @Query("DELETE FROM device")
     fun deleteAll()
+}
+@Dao
+interface AnalyticsDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    fun insert(entity: AnalyticsEntity)
+
+    @Query("SELECT * FROM analytics WHERE runId = :runId ORDER BY ts ASC")
+    fun byRun(runId: String): List<AnalyticsEntity>
+
+    @Query("DELETE FROM analytics WHERE ts < :olderThanMs")
+    fun prune(olderThanMs: Long)
 }

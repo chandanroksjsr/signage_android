@@ -9,8 +9,8 @@ import retrofit2.converter.kotlinx.serialization.asConverterFactory
 object Net {
 
     // TODO: replace with your real endpoints
-    const val WS_URL   = "http://192.168.29.175"
-//    const val WS_URL   = "https://signage.digitopia.live"
+//    const val WS_URL   = "http://192.168.29.175"
+    const val WS_URL   = "https://signage.digitopia.live"
     const val BASE_URL = "$WS_URL/"
 
 

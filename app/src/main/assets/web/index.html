@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Device Wi-Fi Setup</title>
+    <style>
+        :root {
+          --bg:#0f1115; --card:#161a22; --muted:#8a93a5; --fg:#e8ecf1; --pri:#6aa8ff; --ok:#39d98a; --warn:#ffcc66; --err:#ff6b6b;
+          --br:14px;
+        }
+        *{box-sizing:border-box}
+        html,body{height:100%}
+        body{
+          margin:0; font:14px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+          color:var(--fg); background:linear-gradient(145deg,#0d1016,#0b0d12 40%, #0f1117 100%);
+          display:flex; align-items:center; justify-content:center; padding:20px;
+        }
+        .card{
+          width:min(680px,100%); background:var(--card); border:1px solid #1e2430; border-radius:var(--br);
+          box-shadow:0 10px 30px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.02);
+          overflow:hidden;
+        }
+        .head{display:flex; align-items:center; justify-content:space-between; padding:16px 18px; border-bottom:1px solid #202637}
+        .head h1{font-size:16px; margin:0; letter-spacing:.3px}
+        .pill{font-size:12px; padding:4px 8px; border-radius:999px; background:#0f1320; color:var(--muted); border:1px solid #242a3a}
+        .body{padding:18px; display:grid; gap:16px}
+        .row{display:grid; grid-template-columns:1fr; gap:12px}
+        @media (min-width:640px){ .row-2{grid-template-columns:1fr 1fr} }
+
+        label .label{display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; color:var(--muted); font-size:12px}
+        select,input{
+          width:100%; padding:12px 12px; border-radius:10px; background:#0f1320; border:1px solid #242a3a; color:var(--fg);
+          outline:none; transition:border .15s ease, box-shadow .15s ease;
+        }
+        select:focus,input:focus{border-color:#2f3b57; box-shadow:0 0 0 3px rgba(106,168,255,.15)}
+        input[disabled]{opacity:.6}
+        .hint{font-size:12px; color:var(--muted)}
+        .bar{height:6px; border-radius:999px; background:#222a3a; overflow:hidden}
+        .bar > span{display:block; height:100%; background:linear-gradient(90deg,#71d4ff,#6aa8ff); width:0%}
+
+        .actions{display:flex; gap:10px; justify-content:flex-end; align-items:center; padding:12px 18px; border-top:1px solid #202637; background:#141925}
+        button{
+          appearance:none; border:1px solid #2a3348; background:#172036; color:var(--fg); padding:10px 14px; border-radius:10px; cursor:pointer;
+        }
+        button.primary{background:linear-gradient(180deg,#2b66ff,#2a57db); border-color:#2a57db}
+        button:disabled{opacity:.6; cursor:not-allowed}
+        .ghost{background:transparent}
+        .right{margin-left:auto}
+
+        .msg{padding:10px 12px; border:1px solid #26304a; background:#131a2a; border-radius:10px; color:var(--muted)}
+        .ok{border-color:#214b37; background:#11271d; color:#9ee6c7}
+        .warn{border-color:#4b4521; background:#272111; color:#ffe6a6}
+        .err{border-color:#4b2121; background:#271111; color:#ffb4b4}
+
+        .rowline{display:flex; align-items:center; gap:10px; font-size:12px; color:var(--muted)}
+        .lock{font-size:13px; vertical-align:-1px}
+        .spin{width:14px; height:14px; border:2px solid #2a3348; border-top-color:#6aa8ff; border-radius:50%; animation:spin 1s linear infinite}
+        @keyframes spin{to{transform:rotate(360deg)}}
+    </style>
+</head>
+<body>
+<main class="card" id="app">
+    <div class="head">
+        <h1>Device Wi-Fi Configuration</h1>
+        <span class="pill" id="status-pill">Status: Unknown</span>
+    </div>
+
+    <div class="body">
+        <div id="banner" class="msg warn" style="display:none"></div>
+
+        <div class="row row-2">
+            <label>
+                <div class="label">
+                    <span>Available networks</span>
+                    <button class="ghost" id="btn-rescan" type="button">⟳ Rescan</button>
+                </div>
+                <select id="ssid" aria-label="SSID"></select>
+                <div class="rowline">
+                    <span class="lock" id="lock-ind">🔒</span>
+                    <span>Security: <b id="sec-label">Unknown</b></span>
+                    <span class="right">Signal:</span>
+                    <div class="bar" style="width:120px"><span id="sig-bar"></span></div>
+                    <span id="sig-text">0%</span>
+                </div>
+            </label>
+
+            <label>
+                <div class="label">
+                    <span>Password
+                        </span>
+                    <button class="ghost" style="visibility:hidden" type="button">⟳ Rescan</button>
+                    <label class="rowline" style="gap:6px">
+                        <input id="showpw" type="checkbox" /> <span>Show</span>
+                    </label>
+
+                </div>
+                <input id="password" type="password" placeholder="Enter password (blank if open)" />
+                <div class="hint">Required for secured networks (WPA/WPA2/WPA3).</div>
+            </label>
+        </div>
+
+        <div id="note" class="msg" style="display:none"></div>
+    </div>
+
+    <div class="actions">
+        <div id="op-state" class="rowline" style="margin-right:auto; display:none">
+            <span class="spin"></span> <span id="op-label">Working…</span>
+        </div>
+        <button id="btn-status" type="button">Check status</button>
+        <button id="btn-connect" class="primary" type="button">Connect</button>
+    </div>
+</main>
+
+<script>
+    (function(){
+      const $ = sel => document.querySelector(sel);
+      const ssidSel   = $('#ssid');
+      const rescanBtn = $('#btn-rescan');
+      const connectBtn= $('#btn-connect');
+      const statusBtn = $('#btn-status');
+      const pwInput   = $('#password');
+      const showPw    = $('#showpw');
+      const secLabel  = $('#sec-label');
+      const lockInd   = $('#lock-ind');
+      const sigBar    = $('#sig-bar');
+      const sigText   = $('#sig-text');
+      const pill      = $('#status-pill');
+      const banner    = $('#banner');
+      const note      = $('#note');
+      const opState   = $('#op-state');
+      const opLabel   = $('#op-label');
+
+      let networks = [];
+      let pollTimer = null;
+
+      showPw.addEventListener('change', () => {
+        pwInput.type = showPw.checked ? 'text' : 'password';
+      });
+
+      ssidSel.addEventListener('change', syncSelectedInfo);
+
+      rescanBtn.addEventListener('click', scan);
+      statusBtn.addEventListener('click', refreshStatus);
+      connectBtn.addEventListener('click', async () => {
+        const sel = ssidSel.value;
+        if (!sel) return toast('Select a network first.', 'warn');
+        const n = networks.find(x => x.ssid === sel);
+        const secure = !!(n && n.secure);
+        const pass = pwInput.value.trim();
+        if (secure && !pass) { toast('Password required for a secured network.', 'err'); return; }
+
+        op('Requesting connection…');
+        try {
+          const r = await fetch('/api/wifi', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ ssid: sel, password: pass })
+          });
+          if (!r.ok) throw new Error('Request failed');
+          toast('Request sent. Approve the device prompt if asked.', 'ok');
+          // Poll status for up to ~60s
+          poll(60, 1500);
+        } catch (e) {
+          toast('Failed to send request: ' + (e.message||e), 'err');
+        } finally {
+          op();
+        }
+      });
+
+      function op(text){
+        if (text){ opState.style.display='flex'; opLabel.textContent=text; }
+        else { opState.style.display='none'; }
+      }
+
+      function toast(text, kind=''){ // '', 'ok', 'warn', 'err'
+        banner.textContent = text;
+        banner.className = 'msg ' + (kind || '');
+        banner.style.display = 'block';
+        if (kind === 'ok')   setTimeout(()=>banner.style.display='none', 4000);
+      }
+
+      function setPill(text, kind='') {
+        pill.textContent = 'Status: ' + text;
+        const base = 'pill';
+        pill.className = base;
+        if (kind === 'ok'){ pill.style.background = '#11271d'; pill.style.color = '#9ee6c7'; }
+        else if (kind === 'warn'){ pill.style.background = '#272111'; pill.style.color = '#ffe6a6'; }
+        else if (kind === 'err'){ pill.style.background = '#271111'; pill.style.color = '#ffb4b4'; }
+        else { pill.style.background='var(--card)'; pill.style.color='var(--muted)'; }
+      }
+
+      function strengthPct(rssi){
+        // Map RSSI (-100 .. -40) to 0..100
+        if (typeof rssi !== 'number') return 0;
+        const pct = Math.round((Math.min(-40, Math.max(-100, rssi)) + 100) / 60 * 100);
+        return Math.max(0, Math.min(100, pct));
+      }
+
+      function syncSelectedInfo(){
+        const sel = ssidSel.value;
+        const n = networks.find(x => x.ssid === sel);
+        const sec = n ? !!n.secure : false;
+        const pct = n ? strengthPct(n.level) : 0;
+        secLabel.textContent = sec ? 'Secured' : 'Open';
+        lockInd.textContent  = sec ? '🔒' : '🔓';
+        sigBar.style.width   = pct + '%';
+        sigText.textContent  = pct + '%';
+        pwInput.disabled = !sec;
+        if (!sec) pwInput.value = '';
+      }
+
+      async function scan(){
+        op('Scanning…');
+        try{
+          const r = await fetch('/api/scan', { cache:'no-store' });
+          if (!r.ok) throw new Error('scan failed');
+          const data = await r.json();
+          networks = normalizeNetworks(data.networks || data || []);
+          if (networks.length === 0) {
+            toast('No networks found. Make sure Location is ON.', 'warn');
+          }
+          rebuildSelect();
+          syncSelectedInfo();
+        }catch(e){
+          toast('Scan error: ' + (e.message||e), 'err');
+        }finally{
+          op();
+        }
+      }
+
+      function normalizeNetworks(arr){
+        // Deduplicate by SSID; keep strongest
+        const map = new Map();
+        arr.forEach(n=>{
+          if (!n || !n.ssid) return;
+          const prev = map.get(n.ssid);
+          if (!prev || (typeof n.level==='number' && n.level > prev.level)) map.set(n.ssid, {
+            ssid: n.ssid,
+            level: typeof n.level==='number' ? n.level : -100,
+            secure: !!n.secure
+          });
+        });
+        return Array.from(map.values()).sort((a,b)=> (Number(b.secure)-Number(a.secure)) || (b.level-a.level) || a.ssid.localeCompare(b.ssid));
+      }
+
+      function rebuildSelect(){
+        ssidSel.innerHTML = '';
+        const opt0 = document.createElement('option');
+        opt0.value = ''; opt0.textContent = '— Select network —';
+        ssidSel.appendChild(opt0);
+        networks.forEach(n=>{
+          const o = document.createElement('option');
+          const pct = strengthPct(n.level);
+          o.value = n.ssid;
+          o.textContent = `${n.ssid}  ${n.secure?'🔒':'🔓'}  ${pct}%`;
+          ssidSel.appendChild(o);
+        });
+        ssidSel.selectedIndex = networks.length ? 1 : 0;
+      }
+
+      async function refreshStatus(){
+        try{
+          const r = await fetch('/api/status', { cache:'no-store' });
+          if (!r.ok) throw new Error('status failed');
+          const s = await r.json();
+          if (s.connected) {
+            setPill(`Connected to ${s.ssid||'network'}`, 'ok');
+            note.style.display='block';
+            note.className='msg ok';
+            note.textContent = `Connected to “${s.ssid||'Wi-Fi'}” (IP ${s.ip||'—'}). This page may stop responding if the hotspot turns off.`;
+            if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+          } else {
+            setPill('Not connected', 'warn');
+            note.style.display='block';
+            note.className='msg';
+            note.textContent = 'Submit a network to connect the device to Wi-Fi. You may need to accept a system prompt on the device.';
+          }
+        }catch(e){
+          setPill('Unknown', 'err');
+          toast('Status error: ' + (e.message||e), 'err');
+        }
+      }
+
+      function poll(maxTicks=40, interval=1500){
+        if (pollTimer) clearInterval(pollTimer);
+        let ticks=0;
+        pollTimer = setInterval(async ()=>{
+          ticks++;
+          try{
+            const r = await fetch('/api/status', { cache:'no-store' });
+            if (r.ok){
+              const s = await r.json();
+              if (s.connected){
+                clearInterval(pollTimer); pollTimer=null;
+                setPill(`Connected to ${s.ssid||'network'}`, 'ok');
+                toast('Connected! If this page stops responding, reconnect to the device’s new network.', 'ok');
+              }
+            }
+          }catch(_){}
+          if (ticks>=maxTicks){ clearInterval(pollTimer); pollTimer=null; }
+        }, interval);
+      }
+
+      // init
+      (async function init(){
+        await refreshStatus();
+        await scan();
+      })();
+
+    })();
+</script>
+</body>
+</html>

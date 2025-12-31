@@ -2,32 +2,60 @@
 package com.ebani.sinage.playback
 
 //noinspection SuspiciousImport
+import android.Manifest
 import android.R
 import android.annotation.SuppressLint
 import android.app.AlarmManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.content.res.ColorStateList
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
+import android.os.Process
+import android.os.SystemClock
 import android.view.Gravity
+import android.view.Surface
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
 import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888
+import androidx.camera.core.ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.updateLayoutParams
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.util.UnstableApi
 import com.ebani.sinage.data.db.AppDatabase
 import com.ebani.sinage.data.p.DevicePrefs
+import com.ebani.sinage.hotspot.NsdAdvertiser
+import com.ebani.sinage.hotspot.LocalWebServer
+import com.ebani.sinage.hotspot.SetupHostService
 import com.ebani.sinage.net.LayoutConfigDTO
 import com.ebani.sinage.net.LayoutRegionDTO
 import com.ebani.sinage.net.SocketHub
@@ -45,12 +73,26 @@ import com.ebani.sinage.util.FileStore
 import com.ebani.sinage.util.MemoryCleaner
 import com.ebani.sinage.util.PlayerBus
 import com.ebani.sinage.util.evaluateDeviceState
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.qrcode.QRCodeWriter
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.serialization.json.Json
 import org.json.JSONObject
 import timber.log.Timber
 import kotlin.math.min
+import androidx.core.graphics.toColorInt
+import com.ebani.sinage.ai.*
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.face.FaceDetection
+import com.google.mlkit.vision.face.FaceDetector
+import com.google.mlkit.vision.face.FaceDetectorOptions
+import androidx.camera.view.PreviewView
+import java.util.UUID
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import kotlin.system.exitProcess
 
 @UnstableApi
 class PlayerActivity : AppCompatActivity() {
@@ -69,6 +111,38 @@ class PlayerActivity : AppCompatActivity() {
 
     /** Prevent overlapping refreshes on bursts of content updates */
     private var refreshJob: Job? = null
+    @Volatile private var buildNonce = 0L
+
+
+    //local server vars
+    private var tapCount = 0
+    private var lastTapAt = 0L
+
+    // Admin portal state
+    private var adminPortalEnabled = false
+    private var webServer: LocalWebServer? = null
+    private var nsdAdvertiser: NsdAdvertiser? = null
+    private lateinit var serverIndicator: View
+
+    private lateinit var statusStrip: LinearLayout
+    private lateinit var socketIcon: ImageView
+    private lateinit var hotspotIcon: ImageView
+
+    private var cameraExecutor: ExecutorService? = null
+    private var cameraBound = false
+    private lateinit var faceDetector: FaceDetector
+    private lateinit var ageGenderEmotion: AgeGenderEmotionDetector
+    private lateinit var faceEmbedder: FaceEmbedder
+    private val identityTracker = IdentityTracker()
+    private lateinit var analytics: AnalyticsManager
+
+    // last active region (for attribution if you don’t do geometry mapping)
+    @Volatile private var lastActiveRegionId: String? = null
+
+    // camera preview
+    private var camPreviewBox: FrameLayout? = null
+    private lateinit var previewView: PreviewView
+    private var preview: Preview? = null
 
     private val socketListener = object : SocketHub.Listener {
         @RequiresApi(Build.VERSION_CODES.R)
@@ -132,8 +206,8 @@ class PlayerActivity : AppCompatActivity() {
         am.setExact(AlarmManager.RTC, System.currentTimeMillis() + 300L, pi)
 
         finishAffinity()
-        android.os.Process.killProcess(android.os.Process.myPid())
-        kotlin.system.exitProcess(0)
+        Process.killProcess(Process.myPid())
+        exitProcess(0)
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -187,12 +261,268 @@ class PlayerActivity : AppCompatActivity() {
 
     // ────────────────────────────────────────────────────────────────────────────
 
+    // local server
+    private fun toggleAdminPortal() {
+        if (adminPortalEnabled) stopAdminPortal() else startAdminPortal()
+        setServerIndicator(adminPortalEnabled)
+
+    }
+    // Hotspot/QR
+    private var hotspotRunning = false
+    private var hotspotClientSeen = false
+    private var hotspotSsid: String? = null
+    private var hotspotPass: String? = null
+    private var qrOverlay: FrameLayout? = null
+    private var qrImage: ImageView? = null
+    private var qrText: TextView? = null
+    private fun showOrUpdateQr(ssid: String?, pass: String?, port1: Int) {
+        val safeSsid = ssid?.takeIf { it.isNotBlank() } ?: "Sinage-Setup"
+        val safePass = pass?.takeIf { it.isNotBlank() } ?: "(none)"
+        val url = "${SetupHostService.guessApAddress()}:$port1/"
+
+        if (qrOverlay == null) {
+            // full-screen host (transparent) so we can anchor a small card bottom-left
+            qrOverlay = FrameLayout(this).apply {
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+                // transparent so it doesn't dim the player
+                setBackgroundColor(Color.TRANSPARENT)
+                // tap anywhere on the small card to hide (optional)
+                isClickable = false
+            }
+
+            // small card anchored bottom-left
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                val pad = dp(10)
+                setPadding(pad, pad, pad, pad)
+                background = GradientDrawable().apply {
+                    cornerRadius = dp(12).toFloat()
+                    setColor(0xCC111111.toInt()) // semi-opaque dark
+                }
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    gravity = Gravity.BOTTOM or Gravity.START
+                    val m = dp(12)
+                    setMargins(m, m, m, m)
+                }
+                isClickable = true
+                setOnClickListener { hideQr() } // remove if you don't want dismiss-on-tap
+            }
+
+            qrImage = ImageView(this).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(160), dp(160))
+                // keep crisp edges
+                scaleType = ImageView.ScaleType.FIT_XY
+            }
+            qrText = TextView(this).apply {
+                setTextColor(Color.WHITE)
+                textSize = 12f
+                setLineSpacing(0f, 1.15f)
+                // a little spacing from the QR
+                val lp = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+                lp.topMargin = dp(8)
+                layoutParams = lp
+            }
+
+            card.addView(qrImage)
+            card.addView(qrText)
+            qrOverlay!!.addView(card)
+            root.addView(qrOverlay)
+        }
+
+        // Update text (below QR)
+        qrText?.text = "SSID: $safeSsid\nPW: $safePass\nURL: $url"
+
+        // Generate/refresh QR
+        // Encodes Wi-Fi credentials and the URL. Works for both iOS/Android scanners.
+        val wifiPayload = "WIFI:S:$safeSsid;T:WPA;P:${if (safePass == "(none)") "" else safePass};;"
+        val img = makeQr("$wifiPayload\n$url", dp(160), dp(160))
+        qrImage?.setImageBitmap(img)
+
+        qrOverlay?.visibility = View.VISIBLE
+    }
+
+    private fun hideQr() {
+        qrOverlay?.visibility = View.GONE
+    }
+
+    private fun makeQr(text: String, size: Int, dp: Int): Bitmap {
+        val hints = mapOf(EncodeHintType.MARGIN to 1)
+        val matrix = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, size, size, hints)
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        for (y in 0 until size) {
+            for (x in 0 until size) {
+                bmp.setPixel(x, y, if (matrix[x, y]) Color.BLACK else Color.WHITE)
+            }
+        }
+        return bmp
+    }
+
+    private fun attachCameraPreviewBox() {
+        if (camPreviewBox != null) return
+
+        camPreviewBox = FrameLayout(this).apply {
+            val w = dp(160); val h = dp(120) // tweak size if you want
+            layoutParams = FrameLayout.LayoutParams(w, h).apply {
+                gravity = Gravity.TOP or Gravity.END
+                val m = dp(12)
+                setMargins(m, dp(40), m, m) // small top offset
+            }
+            background = GradientDrawable().apply {
+                cornerRadius = dp(14).toFloat()
+                setColor(0xCC000000.toInt()) // translucent black
+                setStroke(dp(1), 0x33FFFFFF) // subtle border
+            }
+            clipToOutline = true
+            elevation = dp(6).toFloat()
+            isClickable = true
+            contentDescription = "camera_preview"
+        }
+
+        previewView = PreviewView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+            scaleType = PreviewView.ScaleType.FILL_CENTER
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+        }
+
+        camPreviewBox!!.addView(previewView)
+        root.addView(camPreviewBox)
+    }
+
+    private val hotspotReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            when (intent?.action) {
+                SetupHostService.ACTION_STATE -> {
+
+
+                    val running = intent.getBooleanExtra(SetupHostService.EXTRA_RUNNING, false)
+                    println("States: $running")
+                    if (running) {
+                        val ssid = intent.getStringExtra(SetupHostService.EXTRA_SSID).orEmpty()
+                        val pass = intent.getStringExtra(SetupHostService.EXTRA_PASS).orEmpty()
+                        val port = intent.getIntExtra(SetupHostService.EXTRA_PORT, 8080).coerceAtLeast(1)
+                        showOrUpdateQr(ssid, pass, port)
+                    } else {
+                        hideQr()
+                    }
+                }
+                SetupHostService.ACTION_CLIENT_JOINED -> {
+                    // any client touched our server → hide QR
+                    hideQr()
+                }
+            }
+        }
+    }
+
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
+    override fun onStart() {
+        super.onStart()
+
+        val filter = IntentFilter().apply {
+            addAction(SetupHostService.ACTION_STATE)
+            addAction(SetupHostService.ACTION_CLIENT_JOINED)
+        }
+
+        if (Build.VERSION.SDK_INT >= 33) {
+            // Android 13+ requires an explicit exported/not-exported flag for non-system broadcasts
+            registerReceiver(hotspotReceiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(hotspotReceiver, filter)
+        }
+    }
+
+    override fun onStop() {
+        runCatching { unregisterReceiver(hotspotReceiver) }
+        super.onStop()
+    }
+    private fun startAdminPortal() {
+        if (adminPortalEnabled) return
+        try {
+            ensurePermsAndStart()
+
+            adminPortalEnabled = true
+            Toast.makeText(this, "Admin portal ON (Hotspot + Web)", Toast.LENGTH_SHORT).show()
+            // Optional UI hint
+            lifecycleScope.launch { showStatusOverlay("Admin portal enabled.\nConnect and open http://192.168.49.1:8080", true) }
+        } catch (t: Throwable) {
+            Timber.e(t, "Failed to start admin portal")
+            Toast.makeText(this, "Failed to start portal: ${t.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun stopAdminPortal() {
+        try {
+            nsdAdvertiser?.unregister()
+        } catch (_: Throwable) { }
+        nsdAdvertiser = null
+
+        try {
+            webServer?.stop()
+        } catch (_: Throwable) { }
+        webServer = null
+
+        try {
+            SetupHostService.stop(this)
+        } catch (_: Throwable) { }
+
+        adminPortalEnabled = false
+        Toast.makeText(this, "Admin portal OFF", Toast.LENGTH_SHORT).show()
+    }
+
+    fun setServerIndicator(running: Boolean) {
+        hotspotIcon.post {
+            hotspotIcon.visibility = if (running) View.VISIBLE else View.GONE
+            hotspotIcon.alpha = if (running) 1f else 0f
+        }
+    }
+    private val launcher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        // After user response, try starting
+        SetupHostService.start(this)
+    }
+    //-------------------------------------------------------------------------------------
+    private fun ensurePermsAndStart() {
+        val wants = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
+//        if (Build.VERSION.SDK_INT >= 33) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            wants += Manifest.permission.NEARBY_WIFI_DEVICES
+            wants += Manifest.permission.POST_NOTIFICATIONS
+        }
+
+            wants += Manifest.permission.ACCESS_FINE_LOCATION
+        wants += Manifest.permission.ACCESS_WIFI_STATE
+        wants += Manifest.permission.CAMERA
+//        }
+        val missing = wants.filter {
+            ActivityCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) launcher.launch(missing.toTypedArray())
+        else SetupHostService.start(this)
+    }
+
     @RequiresApi(Build.VERSION_CODES.R)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setShowWhenLocked(true)
         setTurnScreenOn(true)
+
+
+
+
         window.addFlags(
             WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
                     WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
@@ -227,6 +557,43 @@ class PlayerActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
+
+
+
+        root.isClickable = true
+        root.setOnClickListener {
+            val now = SystemClock.elapsedRealtime()
+            tapCount = if (now - lastTapAt < 600) tapCount + 1 else 1
+            lastTapAt = now
+
+            if (tapCount >= 5) {
+                tapCount = 0
+                toggleAdminPortal()
+            }
+        }
+        serverIndicator = View(this).apply {
+            background = makeCircleDrawable(Color.parseColor("#60A5FA")) // blue-ish
+            val size = dp(14)
+            layoutParams = FrameLayout.LayoutParams(size, size).apply {
+                gravity = Gravity.BOTTOM or Gravity.START
+                val m = dp(12)
+                setMargins(m, m, m, m)
+            }
+            elevation = dp(2).toFloat()
+            contentDescription = "server_indicator"
+            alpha = 1f
+            visibility = View.GONE   // hidden until server mode is enabled
+        }
+        root.addView(serverIndicator)
+
+
+
+
+
+
+
+
+
         stage = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             layoutParams = FrameLayout.LayoutParams(
@@ -236,22 +603,63 @@ class PlayerActivity : AppCompatActivity() {
         root.addView(stage)
 
         // Socket indicator (bottom-right)
-        socketIndicator = View(this).apply {
-            background = makeCircleDrawable(Color.RED)
-            val size = dp(14)
-            layoutParams = FrameLayout.LayoutParams(size, size).apply {
+        // Bottom-right tiny status strip (hotspot + cloud)
+        statusStrip = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
                 gravity = Gravity.BOTTOM or Gravity.END
-                val m = dp(12)
-                setMargins(m, m, m, m)
+                val m = dp(12); setMargins(m, m, m, m)
             }
-            elevation = dp(2).toFloat()
-            contentDescription = "socket_indicator"
-            alpha = 1f
-            visibility = View.VISIBLE
         }
-        root.addView(socketIndicator)
+
+        hotspotIcon = ImageView(this).apply {
+            // hidden until hotspot/server is ON
+            setImageResource(com.ebani.sinage.R.drawable.ic_hotspot)
+            imageTintList = ColorStateList.valueOf(Color.parseColor("#F59E0B")) // amber
+            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).apply {
+                rightMargin = dp(8)
+            }
+            visibility = View.GONE
+            alpha = 0f
+        }
+
+        socketIcon = ImageView(this).apply {
+            // default: offline
+            setImageResource(com.ebani.sinage.R.drawable.ic_cloud_off)
+            imageTintList = ColorStateList.valueOf(Color.parseColor("#EF4444")) // red
+            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20))
+        }
+
+        statusStrip.addView(hotspotIcon)
+        statusStrip.addView(socketIcon)
+        root.addView(statusStrip)
 
         setContentView(root)
+        attachCameraPreviewBox()
+
+        analytics = AnalyticsManager(AppDatabase.getInstance(applicationContext))
+        analytics.start()
+
+        ageGenderEmotion = AgeGenderEmotionDetector(this)
+        faceEmbedder = TFLiteFaceEmbedder(this)
+
+        // ML Kit face detector (fast, with head pose + eyes)
+        faceDetector = FaceDetection.getClient(
+            FaceDetectorOptions.Builder()
+                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+                .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_NONE)
+                .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL) // eye open probs
+                .setContourMode(FaceDetectorOptions.CONTOUR_MODE_NONE)
+                .enableTracking() // ML Kit ID (not used for identityTracker, but ok)
+                .build()
+        )
+
+        // Start vision (camera) once UI is up
+        ensureCameraPermissionThen { startVision() }
+
 
         // Initialize indicator from current hub state if available
         runCatching {
@@ -262,6 +670,138 @@ class PlayerActivity : AppCompatActivity() {
         // Initial sync + UI decide
         checkWithServerForPair()
     }
+    private fun ensureCameraPermissionThen(onOk: () -> Unit) {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            == PackageManager.PERMISSION_GRANTED) { onOk(); return }
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+            if (ok) onOk() else Toast.makeText(this, "Camera permission required for analytics", Toast.LENGTH_LONG).show()
+        }.launch(Manifest.permission.CAMERA)
+    }
+
+    private fun startVision() {
+        if (cameraBound) return
+        cameraExecutor = Executors.newSingleThreadExecutor()
+
+        val providerFuture = ProcessCameraProvider.getInstance(this)
+        providerFuture.addListener({
+            val provider = providerFuture.get()
+
+            // ---- Analysis ----
+            val rotation = previewView.display?.rotation ?: Surface.ROTATION_0
+            val analysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .setTargetRotation(rotation)
+                .build()
+            analysis.setAnalyzer(cameraExecutor!!) { proxy -> analyzeFrame(proxy) }
+
+            // ---- Preview ----
+            preview = Preview.Builder()
+                .setTargetRotation(rotation)
+                .build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+
+            val selector = CameraSelector.Builder()
+                .requireLensFacing(CameraSelector.LENS_FACING_FRONT)
+                .build()
+
+            try {
+                provider.unbindAll()
+                // bind BOTH preview and analysis
+                provider.bindToLifecycle(this, selector, preview, analysis)
+                cameraBound = true
+                camPreviewBox?.visibility = View.VISIBLE
+            } catch (t: Throwable) {
+                Timber.e(t, "CameraX bind failed")
+                camPreviewBox?.visibility = View.GONE
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+
+    private fun analyzeFrame(imageProxy: ImageProxy) {
+        try {
+            // RGBA buffer → Bitmap
+            val bmp = rgbaProxyToBitmap(imageProxy) ?: run { imageProxy.close(); return }
+
+            // Run ML Kit face detection on the SAME bitmap (rotation = 0)
+            val input = InputImage.fromBitmap(bmp, 0)
+            faceDetector.process(input)
+                .addOnSuccessListener { faces ->
+                    if (faces.isEmpty()) {
+                        imageProxy.close()
+                        return@addOnSuccessListener
+                    }
+                    val now = System.currentTimeMillis()
+
+                    // Build DetFace list
+                    val dets = ArrayList<DetFace>(faces.size)
+                    val attribsForWindow = ArrayList<FaceAttrib>(faces.size)
+
+                    for (f in faces) {
+                        val crop = cropFace(bmp, f.boundingBox) ?: continue
+
+                        // A/G/E (+ gaze optional via ML Kit angles)
+                        val attrib = ageGenderEmotion.inferOnCroppedFace(crop)
+                        attribsForWindow += attrib
+
+                        // Embedding for identity
+                        val emb = faceEmbedder.embed(crop)
+
+                        // bbox to RectF in the camera frame coords
+                        val rectF = RectF(
+                            f.boundingBox.left.toFloat(),
+                            f.boundingBox.top.toFloat(),
+                            f.boundingBox.right.toFloat(),
+                            f.boundingBox.bottom.toFloat()
+                        )
+                        dets += DetFace(rectF, emb, attrib)
+                    }
+
+                    // Update analytics window counts (A/G/E)
+                    val ridForCounts = lastActiveRegionId ?: "full"
+                    analytics.onDetections(ridForCounts, attribsForWindow)
+
+                    // Identity tracking → uniques + dwell
+                    val tracked = identityTracker.update(now, dets)
+
+                    // Attribute each face to a region (simple: last active region)
+                    analytics.onTracked(
+                        now,
+                        { _ -> lastActiveRegionId ?: "full" },
+                        tracked
+                    )
+                }
+                .addOnFailureListener { Timber.w(it, "Face detection failed") }
+                .addOnCompleteListener { imageProxy.close() }
+        } catch (t: Throwable) {
+            Timber.e(t, "analyzeFrame error")
+            imageProxy.close()
+        }
+    }
+    private fun rgbaProxyToBitmap(proxy: ImageProxy): Bitmap? {
+        if (proxy.format != ImageFormat.UNKNOWN &&
+            proxy.format != ImageFormat.YUV_420_888 &&
+            proxy.format != ImageFormat.PRIVATE) {
+            // We asked CameraX for RGBA_8888; planes[0] contains contiguous RGBA
+        }
+        val plane = proxy.planes.firstOrNull() ?: return null
+        val w = proxy.width; val h = proxy.height
+        val buf = plane.buffer
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        buf.rewind()
+        bmp.copyPixelsFromBuffer(buf)
+        return bmp
+    }
+
+    private fun cropFace(src: Bitmap, r: Rect): Bitmap? {
+        val left = r.left.coerceAtLeast(0)
+        val top = r.top.coerceAtLeast(0)
+        val right = r.right.coerceAtMost(src.width)
+        val bottom = r.bottom.coerceAtMost(src.height)
+        if (right <= left || bottom <= top) return null
+        return Bitmap.createBitmap(src, left, top, right - left, bottom - top)
+    }
+
 
     @UnstableApi
     @OptIn(UnstableApi::class)
@@ -269,6 +809,18 @@ class PlayerActivity : AppCompatActivity() {
         SocketHub.removeListener(socketListener)
         regionDownloadJobs.values.forEach { it.cancel() }
         if (::controller.isInitialized) controller.release()
+
+
+        runCatching { faceDetector.close() }
+        runCatching { ageGenderEmotion.close() }
+        runCatching { faceEmbedder.close() }
+        analytics.stop()
+        cameraBound = false
+        cameraExecutor?.shutdown()
+        cameraExecutor = null
+
+
+        if (adminPortalEnabled) stopAdminPortal()
         super.onDestroy()
     }
 
@@ -288,7 +840,7 @@ class PlayerActivity : AppCompatActivity() {
                         .put("deviceInfo", deviceInfo)
                         .put("deviceData", device)
                     emitHandshakeRegistered(device, info = payload)
-                    startHeartbeat(device.deviceId, device.adminUserId)
+                    startHeartbeat(ctx,device.deviceId, device.adminUserId)
                 }
             }
         }
@@ -381,6 +933,7 @@ class PlayerActivity : AppCompatActivity() {
                     driveUiNoTouch()
                 }
                 SyncStatus.OK -> {
+                    try { if (::controller.isInitialized) controller.pauseAndClearSurfaces() } catch (_: Throwable) {}
                     Timber.i("Refresh OK")
                     showRefreshingOverlay(false)
                     driveUiNoTouch()
@@ -463,16 +1016,17 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     // Rebuild flow: (downloads are restarted; controller is (re)created)
+// in rebuildFromConfig(layout: LayoutConfig)
     @OptIn(UnstableApi::class)
     private fun rebuildFromConfig(layout: LayoutConfig) {
-        // stop old region downloads (UI overlays will be rebuilt)
-        regionDownloadJobs.values.forEach { it.cancel() }
-        regionDownloadJobs.clear()
+        // 1) release any previous playback stack (players, surfaces, coroutines)
+        runCatching { if (::controller.isInitialized) controller.release() }
 
-        // (Optional) release controller BEFORE view touch to avoid texture flicker
-        // if (::controller.isInitialized) controller.release()
+        // 2) bump generation and capture a nonce for this build
+        val nonce = ++buildNonce
 
-        buildStage(layout) {
+        // 3) build views for this layout; only continue if this is the latest build
+        buildStage(layout, nonce) {
             controller = PlayerController(
                 context = this,
                 db = AppDatabase.getInstance(applicationContext),
@@ -480,16 +1034,47 @@ class PlayerActivity : AppCompatActivity() {
                 rootStage = stage,
                 layout = layout,
                 scale = computeScale(layout),
+                // you can keep this high — user may define many regions;
+                // PlayerController internally limits concurrent decoders per region playback
                 maxConcurrentVideoRegions = 5
             )
 
-            // Start downloads per region; playback starts after each finishes
+
+            controller.setPlaybackListener(object : PlayerController.PlaybackListener {
+                override fun onAssetStart(regionId: String, playlistId: String?, assetId: String, mediaType: String) {
+                    val now = System.currentTimeMillis()
+                    val runId = UUID.randomUUID().toString()
+                    lastActiveRegionId = regionId
+                    analytics.onAssetStart(
+                        PlaybackCtx(
+                            regionId = regionId,
+                            playlistId = playlistId,
+                            assetId = assetId,
+                            mediaType = mediaType,
+                            startedAtMs = now,
+                            runId = runId
+                        )
+                    )
+                }
+
+                override fun onAssetEnd(regionId: String, playlistId: String?, assetId: String, mediaType: String) {
+                    analytics.onAssetEnd(regionId, System.currentTimeMillis())
+                }
+
+                override fun onRegionActive(regionId: String) {
+                    lastActiveRegionId = regionId
+                }
+            })
+
+
+            // Start per-region downloads; when a region finishes it will call startRegion()
             layout.regions.forEach { r ->
                 val pid = r.playlistId
                 if (!pid.isNullOrBlank()) startRegionDownload(r.id, pid)
             }
         }
     }
+
 
     private fun computeScale(layout: LayoutConfig): Float {
         val availW = root.width.coerceAtLeast(1)
@@ -499,11 +1084,15 @@ class PlayerActivity : AppCompatActivity() {
         return min(availW.toFloat() / dw, availH.toFloat() / dh)
     }
 
-    private fun buildStage(layout: LayoutConfig, onBuilt: () -> Unit) {
+    private fun buildStage(layout: LayoutConfig, nonce: Long, onBuilt: () -> Unit) {
         root.post {
+            // Drop stale work if a newer rebuild started while this Runnable was queued
+            if (nonce != buildNonce) return@post
+
             val s = computeScale(layout)
             val stageW = (layout.design.width * s).toInt()
             val stageH = (layout.design.height * s).toInt()
+
             stage.updateLayoutParams<FrameLayout.LayoutParams> {
                 width = stageW; height = stageH
             }
@@ -511,7 +1100,7 @@ class PlayerActivity : AppCompatActivity() {
             stage.y = (root.height - stageH) / 2f
             stage.setBackgroundColor(parseColorOr(layout.design.bgColor, Color.BLACK))
 
-            // Regions
+            // Recreate region containers cleanly for this generation
             stage.removeAllViews()
             regionOverlays.clear()
             layout.regions.sortedBy { it.z ?: 0 }.forEach { r ->
@@ -529,6 +1118,7 @@ class PlayerActivity : AppCompatActivity() {
             onBuilt()
         }
     }
+
 
     private fun startRegionDownload(regionId: String, playlistId: String) {
         regionDownloadJobs[regionId]?.cancel()
@@ -611,17 +1201,20 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     private fun parseColorOr(s: String?, fallback: Int): Int =
-        try { if (s.isNullOrBlank()) fallback else Color.parseColor(s) } catch (_: Throwable) { fallback }
+        try { if (s.isNullOrBlank()) fallback else s.toColorInt() } catch (_: Throwable) { fallback }
 
     // ── Socket indicator ────────────────────────────────────────────────────────
     fun setSocketIndicator(connected: Boolean) {
-        val color = if (connected) Color.parseColor("#26C281") else Color.RED
-        if (::socketIndicator.isInitialized) {
-            socketIndicator.post {
-                socketIndicator.background = makeCircleDrawable(color)
-                socketIndicator.visibility = View.VISIBLE
-                socketIndicator.alpha = 1f
+        socketIcon.post {
+            val (icon, tint) = if (connected) {
+                com.ebani.sinage.R.drawable.ic_cloud_on to "#22C55E".toColorInt() // green
+            } else {
+                com.ebani.sinage.R.drawable.ic_cloud_off to "#EF4444".toColorInt()   // red
             }
+            socketIcon.setImageResource(icon)
+            socketIcon.imageTintList = ColorStateList.valueOf(tint)
+            socketIcon.visibility = View.VISIBLE
+            socketIcon.alpha = 1f
         }
     }
 

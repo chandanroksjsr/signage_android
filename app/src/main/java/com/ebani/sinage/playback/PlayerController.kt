@@ -60,7 +60,32 @@ class PlayerController(
         var job: Job? = null,
         var isVideoRegion: Boolean = false,
         var listener: Player.Listener? = null,
+
+        // NEW: for analytics callbacks
+        var currentAssetId: String? = null,
+        var currentMediaType: String? = null,
+        var currentPlaylistId: String? = null
     )
+
+    private fun notifyRegionActive(regionId: String) {
+        playbackListener?.onRegionActive(regionId)
+    }
+
+    private fun notifyAssetStart(st: RegionState, region: LayoutRegion, assetId: String, mediaType: String) {
+        st.currentAssetId = assetId
+        st.currentMediaType = mediaType
+        st.currentPlaylistId = region.playlistId
+        notifyRegionActive(region.id)
+        playbackListener?.onAssetStart(region.id, region.playlistId, assetId, mediaType)
+    }
+
+    private fun notifyAssetEnd(st: RegionState, region: LayoutRegion) {
+        val assetId = st.currentAssetId ?: return
+        val mediaType = st.currentMediaType ?: "unknown"
+        playbackListener?.onAssetEnd(region.id, st.currentPlaylistId, assetId, mediaType)
+        st.currentAssetId = null
+        st.currentMediaType = null
+    }
 
     private val regions = ConcurrentHashMap<String, RegionState>()
 
@@ -109,26 +134,39 @@ class PlayerController(
             }
         }
     }
+    // Add this interface and setter near the class header
+    interface PlaybackListener {
+        fun onAssetStart(regionId: String, playlistId: String?, assetId: String, mediaType: String)
+        fun onAssetEnd(regionId: String, playlistId: String?, assetId: String, mediaType: String)
+        fun onRegionActive(regionId: String) { /* optional */ }
+    }
+    private var playbackListener: PlaybackListener? = null
+    fun setPlaybackListener(l: PlaybackListener) { playbackListener = l }
+
 
     /** Start playback for a specific region (mixed mode when allowed). */
     fun startRegion(regionId: String) {
         val region = layout.regions.find { it.id == regionId } ?: return
         val st = ensureRegionState(region) ?: return
 
-        // Stop previous work for this region; tear down player on its looper
+        // NEW: finalize previous asset if any
+        notifyAssetEnd(st, region)
+
+        // Stop previous work …
         st.job?.cancel()
         st.player?.let { p ->
             st.listener?.let { l -> withPlayerLooper(p) { it.removeListener(l) } }
             withPlayerLooper(p) {
                 try {
-                    it.stop()
-                    it.clearMediaItems()
-                    it.release()
+                    it.stop(); it.clearMediaItems(); it.release()
                 } catch (_: Throwable) {}
             }
         }
         st.listener = null
         st.player = null
+
+        // NEW: signal the region is now active
+        notifyRegionActive(region.id)
 
         st.job = scope.launch {
             val items = withContext(Dispatchers.IO) {
@@ -142,12 +180,10 @@ class PlayerController(
 
             val hasVideo = items.any { it.kind == Kind.VIDEO }
             if (!hasVideo) {
-                // images-only
                 playImagesLoop(st, region, items.filter { it.kind == Kind.IMAGE })
                 return@launch
             }
 
-            // Atomic cap to avoid decoder thrash/flicker
             val acquired = videoSlots.tryAcquire()
             if (!acquired) {
                 playImagesLoop(st, region, items.filter { it.kind == Kind.IMAGE })
@@ -172,16 +208,18 @@ class PlayerController(
                             val targetH = (region.h * scale).toInt().coerceAtLeast(1)
                             st.imageView.load(u.uri, imageLoader) {
                                 size(Size(Dimension.Pixels(targetW), Dimension.Pixels(targetH)))
-                                allowRgb565(true)
-                                crossfade(false)
+                                allowRgb565(true); crossfade(false)
                             }
+
+                            // NEW: signal start/end around the image dwell
+                            notifyAssetStart(st, region, u.assetId, "image")
                             delay(u.durMs)
+                            notifyAssetEnd(st, region)
                         }
                         Kind.VIDEO -> {
                             st.imageView.visibility = View.INVISIBLE
                             st.contentFrame.visibility = View.VISIBLE
 
-                            // Re-resolve right before play to avoid ENOENT if file was cleaned up
                             val playUri = resolvePlayableUri(u.assetId)
                             if (playUri == null) {
                                 Timber.w("[Player] missing asset %s, skipping", u.assetId)
@@ -192,13 +230,14 @@ class PlayerController(
                                 continue
                             }
 
+                            // NEW: start/end around video playback
+                            notifyAssetStart(st, region, u.assetId, "video")
                             try {
-                                playOneVideo(player, playUri) // returns when ended or on error
+                                playOneVideo(player, playUri) // suspends until ended/error
                             } catch (t: Throwable) {
                                 Timber.e(t, "[Player] video error; skipping")
-                                st.contentFrame.visibility = View.INVISIBLE
-                                st.imageView.visibility = View.VISIBLE
-                                delay(250)
+                            } finally {
+                                notifyAssetEnd(st, region)
                             }
                         }
                     }
@@ -210,6 +249,7 @@ class PlayerController(
             }
         }
     }
+
 
     /** Mixed loop (not used by startRegion anymore, kept for completeness/tests). */
     private fun playMixedLoop(st: RegionState, region: LayoutRegion, items: List<UnitItem>) {
@@ -333,7 +373,9 @@ class PlayerController(
                     allowRgb565(true)
                     crossfade(false)
                 }
+                notifyAssetStart(st, region, u.assetId, "image")
                 delay(u.durMs)
+                notifyAssetEnd(st, region)
                 i++
             }
         }
@@ -341,11 +383,56 @@ class PlayerController(
 
     /** Release everything; safe to call from any thread. */
     fun release() {
-        val main = android.os.Handler(Looper.getMainLooper())
-        if (Looper.myLooper() === Looper.getMainLooper()) {
-            doRelease()
-        } else {
-            main.post { doRelease() }
+
+
+        runCatching { scope.cancel() }
+
+        regions.values.forEach { st ->
+            // detach and release the player
+            st.player?.let { p ->
+                withPlayerLooper(p) {
+                    try {
+                        it.clearVideoSurfaceView(st.textureView) // ✅ SurfaceView, not TextureView
+                        it.stop()
+                        it.clearMediaItems()
+                        it.release()
+                    } catch (_: Throwable) { }
+                }
+            }
+            st.player = null
+            st.listener = null
+
+            // free image memory
+            st.imageView.setImageDrawable(null)
+
+            // (optional) remove our two overlay views from the region container
+            runCatching {
+                st.container.removeView(st.contentFrame)
+                st.container.removeView(st.imageView)
+            }
+        }
+        regions.clear()
+
+    }
+    // optional convenience inside PlayerController
+    fun stopAllRegions() {
+        regions.values.forEach { st ->
+            st.job?.cancel()
+            st.job = null
+            st.player?.let { p ->
+                withPlayerLooper(p) {
+                    try {
+                        it.playWhenReady = false
+                        it.clearVideoSurfaceView(st.textureView)
+                        it.clearVideoSurface()
+                        it.stop()
+                        it.clearMediaItems()
+                    } catch (_: Throwable) {}
+                }
+            }
+            st.imageView.setImageDrawable(null)
+            st.contentFrame.visibility = View.INVISIBLE
+            st.imageView.visibility = View.INVISIBLE
         }
     }
 

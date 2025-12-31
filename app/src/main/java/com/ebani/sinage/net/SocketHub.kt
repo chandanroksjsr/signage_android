@@ -59,8 +59,8 @@ object SocketHub {
     fun broadcast(deviceId: String?, payload: JSONObject) {
         client?.broadcast(deviceId, payload)
     }
-    fun startHeartbeat(deviceId: String?, userId:String?){
-        client?.startHeartbeat(deviceId =deviceId, userId = userId)
+    fun startHeartbeat(ctx: Context, deviceId: String?, userId: String?) {
+        client?.startHeartbeat(ctx = ctx, deviceId = deviceId, userId = userId)
     }
     fun stopheartBeat(){
         client?.stopHeartbeat()
